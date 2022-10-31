@@ -1,14 +1,13 @@
 use std::{io, mem};
-use std::cmp::min;
 use std::convert::TryInto;
 use std::intrinsics::copy_nonoverlapping;
 use std::io::Write;
-use std::sync::MutexGuard;
 
 use anyhow::Result;
-use log::info;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+use crate::protocol::close_connection;
 
 pub fn get_var_u32_size(num: u32) -> u32 {
     // [5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1]
@@ -78,13 +77,28 @@ impl Buf {
         let write_index = vec.len() as u32;
         Buf { buffer: vec, write_index, read_index: 0, write_mark: 0, read_mark: 0 }
     }
-    pub async fn read(stream: &mut TcpStream) -> Result<Buf> {
+    pub async fn read(stream: &mut TcpStream, max_length: u32) -> Result<Buf> {
         // Packet size is saved as a var u32 in front of the packet
         let buf_length = s_read_var_u32(stream).await?;
+        if max_length > 0 && buf_length > max_length {
+            close_connection(stream).await;
+            panic!("sent packet length {} is bigger than max length {}", buf_length, max_length);
+        }
+
         let mut buf = vec![0u8; buf_length as usize];
 
         stream.read_exact(&mut buf).await?;
         return Ok(Buf::from_vec(buf));
+    }
+
+    pub fn copy(&self) -> Buf {
+        Buf {
+            buffer: self.buffer.to_vec(),
+            write_index: self.write_index,
+            read_index: self.read_index,
+            write_mark: self.write_mark,
+            read_mark: self.read_mark,
+        }
     }
 
     pub fn is_nonoverlapping<T>(src: *const T, dst: *const T, count: usize) -> bool {

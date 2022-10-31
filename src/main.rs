@@ -3,17 +3,27 @@ extern crate core;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use log::{error, info, warn};
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::buffer::{Buf, s_write_var_u32};
+use crate::buffer::Buf;
 use crate::config::Config;
+use crate::protocol::{close_connection, read_packet, send_packet, validate_handshake};
 
 mod buffer;
 mod protocol;
+mod config;
+
+static MAX_HANDSHAKE_LENGTH: u32 = 0
+    + 5 // protocol version (var u32)
+    + 1 // hostname length (var u32)
+    + 255 // hostname (string), can theoretically be non-ascii, but that doesn't happen
+    + 2 // port (u16)
+    + 1 // next status (var u32), can only be 1 or 2, so length is 1
+;
 
 #[tokio::main]
 async fn main() {
@@ -26,33 +36,28 @@ async fn main() {
     // Heavily inspired by https://github.com/Eoghanmc22/rust-mc-bot/blob/b77382357cb0995446a6973d786085aa3abea029/src/main.rs,
     // because I don't have a good understanding of rust's syntax yet :(
     let args: Vec<String> = env::args().collect();
-    info!("Hello, world!");
 
-    let config_path = args.get(1).unwrap_or(&String::from("config.yml"));
+    let def_config_path = String::from("config.yml");
+    let config_path = args.get(1).unwrap_or(&def_config_path);
+
     let config = Config::load_or_init(Path::new(config_path));
+    let mut listener = TcpListener::bind(config.get_bind_addr()).await.unwrap();
 
-    let bind_addr = config.get_bind_addr();
-    let redir_addr = config.get_redir_addr();
-
-    let mut listener = TcpListener::bind(bind_addr).await.unwrap();
+    info!("listening on {}, redirecting to {}", config.get_bind_addr(), config.get_connect_addr());
+    let config = Arc::new(config);
 
     loop {
         let client = accept_client(&mut listener).await;
         if let Err(err) = client {
-            error!("Failed to accept client: {}", err);
+            error!("failed to accept client: {}", err);
             continue;
         }
 
-        let unwrapped_client = client.unwrap();
-        let stream = unwrapped_client.0;
-        let address = unwrapped_client.1;
+        let (stream, addr) = client.unwrap();
+        let config = Arc::clone(&config);
 
         tokio::spawn(async move {
-            let result = handle_client(stream, redir_addr, address).await;
-
-            if let Err(err) = result {
-                error!("{}: An error occurred: {}", address, err);
-            }
+            handle_client(&config, stream, &addr).await.unwrap();
         });
     }
 }
@@ -63,16 +68,26 @@ async fn accept_client(stream: &mut TcpListener) -> Result<(TcpStream, SocketAdd
     return Ok(client);
 }
 
-async fn handle_client(stream: TcpStream, connect: SocketAddr, address: SocketAddr) -> Result<()> {
-    let mut server = TcpStream::connect(connect).await?;
-    server.set_nodelay(true)?;
+async fn handle_client(config: &Config, mut stream: TcpStream, addr: &SocketAddr) -> Option<()> {
+    let handshake = read_packet(&mut stream, MAX_HANDSHAKE_LENGTH).await.unwrap();
+    if let Some(validated_handshake) = validate_handshake(&mut handshake.1.copy(), addr) {
+        info!("handshake version: {}, vhost: {}:{}, next state: {}", validated_handshake.0, validated_handshake.1, validated_handshake.2, if validated_handshake.3 == 2 { "login" }  else {"status" });
+        let host = validated_handshake.1.as_str();
+        if !config.check_host(host) {
+            error!("invalid hostname specified in packet: {}", host);
+            close_connection(&mut stream).await;
+            return Some(());
+        }
+    } else {
+        close_connection(&mut stream).await;
+        return Some(());
+    }
+
+    let mut server = TcpStream::connect(config.get_connect_addr()).await.unwrap();
+    server.set_nodelay(true).unwrap();
 
     let mut info_buf = Buf::new();
-
-    // Identifier for this pre-proxy
-    info_buf.write_u32(69_1337_42u32);
-
-    match address.ip() {
+    match addr.ip() {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
             info_buf.write_var_u32(octets.len() as u32);
@@ -84,10 +99,10 @@ async fn handle_client(stream: TcpStream, connect: SocketAddr, address: SocketAd
             info_buf.write_bytes(octets.as_slice());
         }
     }
-    info_buf.write_u16(address.port());
+    info_buf.write_u16(addr.port());
 
-    s_write_var_u32(&mut server, info_buf.get_writer_index()).await;
-    server.write(info_buf.read_remaining_bytes()).await?;
+    send_packet(&mut server, 69_1337_42u32, info_buf).await; // write connection info
+    send_packet(&mut server, handshake.0, handshake.1).await; // write mc handshake
 
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
     let (mut server_reader, mut server_writer) = tokio::io::split(server);
@@ -95,14 +110,14 @@ async fn handle_client(stream: TcpStream, connect: SocketAddr, address: SocketAd
     tokio::spawn(async move {
         let result = tokio::io::copy(&mut client_reader, &mut server_writer).await;
         if let Some(err) = result.err() {
-            warn!("[{}] Error in client-to-server bridge: {}", address, err);
+            warn!("error in serverbound writer: {}", err);
         }
     });
 
     let result = tokio::io::copy(&mut server_reader, &mut client_writer).await;
     if let Some(err) = result.err() {
-        warn!("[{}] Error in server-to-client bridge: {}", address, err);
+        warn!("Error in clientbound writer: {}", err);
     }
 
-    return Ok(());
+    return Some(());
 }
