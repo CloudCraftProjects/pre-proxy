@@ -6,8 +6,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::{error, info, warn};
+use futures::FutureExt;
+use log::{error, info};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 
 use crate::buffer::Buf;
 use crate::config::Config;
@@ -24,6 +27,8 @@ static MAX_HANDSHAKE_LENGTH: u32 = 0
     + 2 // port (u16)
     + 1 // next status (var u32), can only be 1 or 2, so length is 1
 ;
+
+const BUF_SIZE: usize = 1024;
 
 #[tokio::main]
 async fn main() {
@@ -68,10 +73,90 @@ async fn accept_client(stream: &mut TcpListener) -> Result<(TcpStream, SocketAdd
     return Ok(client);
 }
 
+// copied from https://github.com/mqudsi/tcpproxy/blob/99f64a3b3d7509ca77fbfa5e9cade48d72202166/src/main.rs (MIT license),
+// as tokio's copy methods don't close connections properly
+
+// Two instances of this function are spawned for each half of the connection: client-to-server,
+// server-to-client. We can't use tokio::io::copy() instead (no matter how convenient it might
+// be) because it doesn't give us a way to correlate the lifetimes of the two tcp read/write
+// loops: even after the client disconnects, tokio would keep the upstream connection to the
+// server alive until the connection's max client idle timeout is reached.
+async fn copy_with_abort<R, W>(
+    read: &mut R,
+    write: &mut W,
+    mut abort: broadcast::Receiver<()>,
+) -> tokio::io::Result<usize>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut copied = 0;
+    let mut buf = [0u8; BUF_SIZE];
+    loop {
+        let bytes_read;
+        tokio::select! {
+                biased;
+
+                result = read.read(&mut buf) => {
+                    use std::io::ErrorKind::{ConnectionReset, ConnectionAborted};
+                    bytes_read = result.or_else(|e| match e.kind() {
+                        // Consider these to be part of the proxy life, not errors
+                        ConnectionReset | ConnectionAborted => Ok(0),
+                        _ => Err(e)
+                    })?;
+                },
+                _ = abort.recv() => {
+                    break;
+                }
+            }
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        // While we ignore some read errors above, any error writing data we've already read to
+        // the other side is always treated as exceptional.
+        write.write_all(&buf[0..bytes_read]).await?;
+        copied += bytes_read;
+    }
+
+    Ok(copied)
+}
+
+async fn start_proxy(mut stream: TcpStream, mut server: TcpStream) -> Option<()> {
+    let (mut client_reader, mut client_writer) = stream.split();
+    let (mut server_reader, mut server_writer) = server.split();
+
+    let (cancel, _) = broadcast::channel::<()>(1);
+    let (remote_copied, client_copied) = tokio::join! {
+                copy_with_abort(&mut server_reader, &mut client_writer, cancel.subscribe())
+                    .then(|r| { let _ = cancel.send(()); async { r } }),
+                copy_with_abort(&mut client_reader, &mut server_writer, cancel.subscribe())
+                    .then(|r| { let _ = cancel.send(()); async { r } }),
+            };
+
+    match client_copied {
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("Error writing bytes from proxy client to upstream server");
+            eprintln!("{}", err);
+        }
+    };
+
+    match remote_copied {
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("Error writing from upstream server to proxy client");
+            eprintln!("{}", err);
+        }
+    };
+
+    return Some(());
+}
+
 async fn handle_client(config: &Config, mut stream: TcpStream, addr: &SocketAddr) -> Option<()> {
     let handshake = read_packet(&mut stream, MAX_HANDSHAKE_LENGTH).await.unwrap();
     if let Some(validated_handshake) = validate_handshake(&mut handshake.1.copy(), addr) {
-        info!("handshake version: {}, vhost: {}:{}, next state: {}", validated_handshake.0, validated_handshake.1, validated_handshake.2, if validated_handshake.3 == 2 { "login" }  else {"status" });
         let host = validated_handshake.1.as_str();
         if !config.check_host(host) {
             error!("invalid hostname specified in packet: {}", host);
@@ -104,20 +189,5 @@ async fn handle_client(config: &Config, mut stream: TcpStream, addr: &SocketAddr
     send_packet(&mut server, 69_1337_42u32, info_buf).await; // write connection info
     send_packet(&mut server, handshake.0, handshake.1).await; // write mc handshake
 
-    let (mut client_reader, mut client_writer) = tokio::io::split(stream);
-    let (mut server_reader, mut server_writer) = tokio::io::split(server);
-
-    tokio::spawn(async move {
-        let result = tokio::io::copy(&mut client_reader, &mut server_writer).await;
-        if let Some(err) = result.err() {
-            warn!("error in serverbound writer: {}", err);
-        }
-    });
-
-    let result = tokio::io::copy(&mut server_reader, &mut client_writer).await;
-    if let Some(err) = result.err() {
-        warn!("Error in clientbound writer: {}", err);
-    }
-
-    return Some(());
+    return start_proxy(stream, server).await;
 }

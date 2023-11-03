@@ -3,6 +3,7 @@ name = "cc-pre-proxy"
 version = "1.0.0"
 authors = ["booky10 <boooky10@gmail.com>"]
 edition = "2018"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -13,3 +14,4 @@ serde_yaml = "0.8"
 anyhow = "1.0"
 env_logger = "0.9.1"
 log = "0.4"
+futures = "0.3.29"
