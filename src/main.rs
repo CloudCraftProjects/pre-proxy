@@ -20,7 +20,7 @@ mod buffer;
 mod protocol;
 mod config;
 
-static MAX_HANDSHAKE_LENGTH: u32 = 0
+const MAX_HANDSHAKE_LENGTH: u32 = 0
     + 5 // protocol version (var u32)
     + 1 // hostname length (var u32)
     + 255 // hostname (string), can theoretically be non-ascii, but that doesn't happen
@@ -62,7 +62,7 @@ async fn main() {
         let config = Arc::clone(&config);
 
         tokio::spawn(async move {
-            handle_client(&config, stream, &addr).await.unwrap();
+            read_handshake(&config, stream, &addr).await.unwrap();
         });
     }
 }
@@ -138,36 +138,45 @@ async fn start_proxy(mut stream: TcpStream, mut server: TcpStream) -> Option<()>
     match client_copied {
         Ok(_) => {}
         Err(err) => {
-            eprintln!("Error writing bytes from proxy client to upstream server");
-            eprintln!("{}", err);
+            error!("Error writing bytes from proxy client to upstream server: {}", err);
         }
     };
 
     match remote_copied {
         Ok(_) => {}
         Err(err) => {
-            eprintln!("Error writing from upstream server to proxy client");
-            eprintln!("{}", err);
+            error!("Error writing from upstream server to proxy client: {}", err);
         }
     };
 
     return Some(());
 }
 
-async fn handle_client(config: &Config, mut stream: TcpStream, addr: &SocketAddr) -> Option<()> {
-    let handshake = read_packet(&mut stream, MAX_HANDSHAKE_LENGTH).await.unwrap();
-    if let Some(validated_handshake) = validate_handshake(&mut handshake.1.copy(), addr) {
-        let host = validated_handshake.1.as_str();
-        if !config.check_host(host) {
-            error!("invalid hostname specified in packet: {}", host);
-            close_connection(&mut stream).await;
-            return Some(());
+async fn read_handshake(config: &Config, mut stream: TcpStream, addr: &SocketAddr) -> Option<()> {
+    let handshake_result = read_packet(&mut stream, MAX_HANDSHAKE_LENGTH).await;
+    return match handshake_result {
+        Ok(handshake) => {
+            if let Some(validated_handshake) = validate_handshake(&mut handshake.1.copy(), addr) {
+                let host = validated_handshake.1.as_str();
+                if !config.check_host(host) {
+                    error!("invalid hostname specified in packet: {}", host);
+                    close_connection(&mut stream).await;
+                    return Some(());
+                }
+            } else {
+                close_connection(&mut stream).await;
+                return Some(());
+            }
+            connect_client(config, stream, addr, handshake).await
         }
-    } else {
-        close_connection(&mut stream).await;
-        return Some(());
+        Err(err) => {
+            error!("Error reading handshake from client: {}", err);
+            Some(())
+        }
     }
+}
 
+async fn connect_client(config: &Config, stream: TcpStream, addr: &SocketAddr, handshake: (u32, Buf)) -> Option<()> {
     let mut server = TcpStream::connect(config.get_connect_addr()).await.unwrap();
     server.set_nodelay(true).unwrap();
 
