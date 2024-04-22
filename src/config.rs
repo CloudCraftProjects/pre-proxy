@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::Path;
 
 use log::info;
@@ -25,17 +25,13 @@ pub struct Config {
 impl ConfigStruct {
     fn parse(&self) -> Config {
         Config {
-            bind: Self::parse_address(&self.bind_address),
-            connect: Self::parse_address(&self.connection_address),
-            hosts: (&self.hosts).into_iter().map(|host| String::from(host)).collect(),
+            bind: self.bind_address.parse().unwrap(),
+            connect: self.connection_address.parse().unwrap(),
+            hosts: (&self.hosts)
+                .into_iter()
+                .map(|host| String::from(host))
+                .collect(),
         }
-    }
-
-    fn parse_address(address: &String) -> SocketAddr {
-        let mut addr_parts = address.split(":");
-        let ip = addr_parts.next().expect("no ip provided");
-        let port: u16 = addr_parts.next().map(|port_string| port_string.parse().expect("invalid port")).unwrap();
-        return (ip, port).to_socket_addrs().expect("not valid socket address").next().expect("no valid socket address");
     }
 }
 
@@ -46,7 +42,10 @@ impl Config {
             info!("reading config file at {}", path.display());
             cfg_struct = serde_yaml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         } else {
-            info!("config file at {} doesn't exist, using defaults", path.display());
+            info!(
+                "config file at {} doesn't exist, using defaults",
+                path.display()
+            );
             cfg_struct = ConfigStruct {
                 bind_address: String::from("127.0.0.1:50580"),
                 connection_address: String::from("192.168.42.42:50542"),
