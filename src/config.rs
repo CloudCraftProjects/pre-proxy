@@ -1,11 +1,11 @@
 // inspired by https://github.com/DoubleCheck0001/rust-minecraft-proxy/blob/47923992632b4990e9149b663817cbef4f01e388/src/config.rs
 
-use std::collections::HashSet;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 
 use log::info;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -19,19 +19,38 @@ struct ConfigStruct {
 pub struct Config {
     bind: SocketAddr,
     connect: SocketAddr,
-    hosts: HashSet<String>,
+    host_regex: Regex,
 }
 
 impl ConfigStruct {
     fn parse(&self) -> Config {
-        Config {
+        let joined_hosts = (&self.hosts)
+            .into_iter()
+            .map(|host| String::from(host))
+            .fold(
+                String::new(),
+                |a, b| {
+                    if a.is_empty() {
+                        b
+                    } else {
+                        a + "|" + &b
+                    }
+                },
+            );
+        let host_regex_str = String::from("^(?:") + &joined_hosts + ")$";
+        let host_regex = Regex::new(host_regex_str.as_str());
+
+        let config = Config {
             bind: self.bind_address.parse().unwrap(),
             connect: self.connection_address.parse().unwrap(),
-            hosts: (&self.hosts)
-                .into_iter()
-                .map(|host| String::from(host))
-                .collect(),
-        }
+            host_regex: host_regex.unwrap(),
+        };
+
+        info!("  bind: {}", config.bind.to_string());
+        info!("  connection target: {}", config.connect.to_string());
+        info!("  host regex: {}", config.host_regex.as_str());
+
+        config
     }
 }
 
@@ -69,7 +88,7 @@ impl Config {
         }
 
         let host = host.to_lowercase();
-        return self.hosts.contains(&host);
+        return self.host_regex.is_match(host.as_str());
     }
 
     pub fn get_bind_addr(&self) -> SocketAddr {
