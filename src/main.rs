@@ -17,8 +17,8 @@ use crate::config::Config;
 use crate::protocol::{close_connection, read_packet, send_packet, validate_handshake};
 
 mod buffer;
-mod protocol;
 mod config;
+mod protocol;
 
 const MAX_HANDSHAKE_LENGTH: u32 = 0
     + 5 // protocol version (var u32)
@@ -34,7 +34,9 @@ const BUF_SIZE: usize = 1024;
 async fn main() {
     // https://github.com/DoubleCheck0001/rust-minecraft-proxy/blob/47923992632b4990e9149b663817cbef4f01e388/src/main.rs
     if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "info");
+        unsafe {
+            env::set_var("RUST_LOG", "info");
+        }
     }
     env_logger::init();
 
@@ -48,7 +50,11 @@ async fn main() {
     let config = Config::load_or_init(Path::new(config_path));
     let mut listener = TcpListener::bind(config.get_bind_addr()).await.unwrap();
 
-    info!("listening on {}, redirecting to {}", config.get_bind_addr(), config.get_connect_addr());
+    info!(
+        "listening on {}, redirecting to {}",
+        config.get_bind_addr(),
+        config.get_connect_addr()
+    );
     let config = Arc::new(config);
 
     loop {
@@ -86,29 +92,29 @@ async fn copy_with_abort<R, W>(
     write: &mut W,
     mut abort: broadcast::Receiver<()>,
 ) -> tokio::io::Result<usize>
-    where
-        R: tokio::io::AsyncRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
     let mut copied = 0;
     let mut buf = [0u8; BUF_SIZE];
     loop {
         let bytes_read;
         tokio::select! {
-                biased;
+            biased;
 
-                result = read.read(&mut buf) => {
-                    use std::io::ErrorKind::{ConnectionReset, ConnectionAborted};
-                    bytes_read = result.or_else(|e| match e.kind() {
-                        // Consider these to be part of the proxy life, not errors
-                        ConnectionReset | ConnectionAborted => Ok(0),
-                        _ => Err(e)
-                    })?;
-                },
-                _ = abort.recv() => {
-                    break;
-                }
+            result = read.read(&mut buf) => {
+                use std::io::ErrorKind::{ConnectionReset, ConnectionAborted};
+                bytes_read = result.or_else(|e| match e.kind() {
+                    // Consider these to be part of the proxy life, not errors
+                    ConnectionReset | ConnectionAborted => Ok(0),
+                    _ => Err(e)
+                })?;
+            },
+            _ = abort.recv() => {
+                break;
             }
+        }
 
         if bytes_read == 0 {
             break;
@@ -129,32 +135,38 @@ async fn start_proxy(mut stream: TcpStream, mut server: TcpStream) -> Option<()>
 
     let (cancel, _) = broadcast::channel::<()>(1);
     let (remote_copied, client_copied) = tokio::join! {
-                copy_with_abort(&mut server_reader, &mut client_writer, cancel.subscribe())
-                    .then(|r| { let _ = cancel.send(()); async { r } }),
-                copy_with_abort(&mut client_reader, &mut server_writer, cancel.subscribe())
-                    .then(|r| { let _ = cancel.send(()); async { r } }),
-            };
+        copy_with_abort(&mut server_reader, &mut client_writer, cancel.subscribe())
+            .then(|r| { let _ = cancel.send(()); async { r } }),
+        copy_with_abort(&mut client_reader, &mut server_writer, cancel.subscribe())
+            .then(|r| { let _ = cancel.send(()); async { r } }),
+    };
 
     match client_copied {
         Ok(_) => {}
         Err(err) => {
-            error!("Error writing bytes from proxy client to upstream server: {}", err);
+            error!(
+                "Error writing bytes from proxy client to upstream server: {}",
+                err
+            );
         }
     };
 
     match remote_copied {
         Ok(_) => {}
         Err(err) => {
-            error!("Error writing from upstream server to proxy client: {}", err);
+            error!(
+                "Error writing from upstream server to proxy client: {}",
+                err
+            );
         }
     };
 
-    return Some(());
+    Some(())
 }
 
 async fn read_handshake(config: &Config, mut stream: TcpStream, addr: &SocketAddr) -> Option<()> {
     let handshake_result = read_packet(&mut stream, MAX_HANDSHAKE_LENGTH).await;
-    return match handshake_result {
+    match handshake_result {
         Ok(handshake) => {
             if let Some(validated_handshake) = validate_handshake(&mut handshake.1.copy(), addr) {
                 let host = validated_handshake.1.as_str();
@@ -176,27 +188,58 @@ async fn read_handshake(config: &Config, mut stream: TcpStream, addr: &SocketAdd
     }
 }
 
-async fn connect_client(config: &Config, stream: TcpStream, addr: &SocketAddr, handshake: (u32, Buf)) -> Option<()> {
+async fn connect_client(
+    config: &Config,
+    stream: TcpStream,
+    addr: &SocketAddr,
+    handshake: (u32, Buf),
+) -> Option<()> {
     let mut server = TcpStream::connect(config.get_connect_addr()).await.unwrap();
     server.set_nodelay(true).unwrap();
 
-    let mut info_buf = Buf::new();
-    match addr.ip() {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            info_buf.write_var_u32(octets.len() as u32);
-            info_buf.write_bytes(octets.as_slice());
-        }
-        IpAddr::V6(ip) => {
-            let octets = ip.octets();
-            info_buf.write_var_u32(octets.len() as u32);
-            info_buf.write_bytes(octets.as_slice());
-        }
-    }
-    info_buf.write_u16(addr.port());
-
-    send_packet(&mut server, 69_1337_42u32, info_buf).await; // write connection info
+    let proxy_protocol_buf = construct_proxy_protocol(addr).buffer;
+    server
+        .write(proxy_protocol_buf.as_slice())
+        .await
+        .expect("failed to write proxy protocol message");
     send_packet(&mut server, handshake.0, handshake.1).await; // write mc handshake
 
-    return start_proxy(stream, server).await;
+    start_proxy(stream, server).await
+}
+
+const PROXY_PROTOCOL_PREFIX: &'static [u8] = &[
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+];
+const PROXY_PROTOCOL_V2: u8 = 0x02 << 4;
+const PROXY_PROTOCOL_COMMAND_PROXY: u8 = 0x01;
+const PROXY_PROTOCOL_PROTOCOL_TCP4: u8 = 0x11;
+const PROXY_PROTOCOL_PROTOCOL_TCP6: u8 = 0x21;
+
+fn construct_proxy_protocol(addr: &SocketAddr) -> Buf {
+    let mut buf = Buf::new();
+
+    buf.write_bytes(PROXY_PROTOCOL_PREFIX); // static prefix
+    buf.write_u8(PROXY_PROTOCOL_V2 | PROXY_PROTOCOL_COMMAND_PROXY); // v2 protocol, set command state
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            buf.write_u8(PROXY_PROTOCOL_PROTOCOL_TCP4); // tcp/ipv4
+            buf.write_u16(4 + 4 + 2 + 2 + 0); // length of following data
+            buf.write_bytes(ip.octets().as_slice()); // source address
+            buf.write_bytes([0u8; 4].as_ref()); // destination address (doesn't matter)
+            buf.write_u16(addr.port()); // source port
+            buf.write_u16(0); // destination port (doesn't matter)
+                              // no TLVs, we're done
+        }
+        IpAddr::V6(ip) => {
+            buf.write_u8(PROXY_PROTOCOL_PROTOCOL_TCP6); // tcp/ipv6
+            buf.write_u16(16 + 16 + 2 + 2 + 0); // length of following data
+            buf.write_bytes(ip.octets().as_slice()); // source address
+            buf.write_bytes([0u8; 16].as_ref()); // destination address (doesn't matter)
+            buf.write_u16(addr.port()); // source port
+            buf.write_u16(0); // destination port (doesn't matter)
+                              // no TLVs, we're done
+        }
+    }
+
+    buf
 }
