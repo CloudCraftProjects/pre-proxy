@@ -1,0 +1,10 @@
+---
+services:
+  app:
+    build: .
+    volumes:
+    - ./run:/app
+    user: "$USER_ID"
+    tty: true
+    stdin_open: true
+    restart: unless-stopped

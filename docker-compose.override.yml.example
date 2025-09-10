@@ -1,0 +1,4 @@
+---
+services:
+  app:
+    network_mode: host

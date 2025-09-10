@@ -1,0 +1,6 @@
+/.git/
+/target/
+/run/
+/*docker*
+/*Docker*
+.env

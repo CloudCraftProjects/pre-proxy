@@ -177,7 +177,7 @@ fabric.properties
 .LSOverride
 
 # Icon must end with two \r
-Icon
+Icon
 
 # Thumbnails
 ._*
@@ -452,3 +452,4 @@ gradle-app.setting
 run/
 .idea/
 *.iml
+docker-compose.override.yml
