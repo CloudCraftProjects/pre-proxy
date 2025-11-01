@@ -15,7 +15,9 @@ jobs:
     steps:
       # https://stackoverflow.com/a/70250677
     - id: lowercase_repo
-      run: REPO=${{ github.repository }} echo "repo=${REPO,,}" >> "$GITHUB_OUTPUT"
+      run: echo "repo=${REPO,,}" >> "$GITHUB_OUTPUT"
+      env:
+        REPO: ${{ github.repository }}
     - uses: actions/checkout@v5
     - uses: docker/setup-qemu-action@v3
     - uses: docker/setup-buildx-action@v3
