@@ -8,10 +8,14 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    if: "!contains(github.event.head_commit.message, 'skip ci') && !contains(github.event.head_commit.message, 'ci skip')"
     permissions:
       contents: read
       packages: write
     steps:
+      # https://stackoverflow.com/a/70250677
+    - id: lowercase_repo
+      run: REPO=${{ github.repository }} echo "::set-output name=repo::${REPO,,}"
     - uses: actions/checkout@v5
     - uses: docker/setup-qemu-action@v3
     - uses: docker/setup-buildx-action@v3
@@ -27,4 +31,4 @@ jobs:
         platforms: linux/amd64,linux/arm64
         push: true
         tags: |
-          ghcr.io/${{ github.repository_owner }}/pre-proxy:latest
+          ghcr.io/${{ steps.lowercase_repo.outputs.repo }}:latest
